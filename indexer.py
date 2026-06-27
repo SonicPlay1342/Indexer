@@ -1,3 +1,10 @@
+#!/usr/bin/env python3
+"""
+Консольный индексатор папок с SQLite.
+Поддерживает: индексацию, поиск дубликатов, сравнение резервных копий,
+отслеживание изменений между сканированиями.
+"""
+
 import os
 import sys
 import sqlite3
@@ -31,6 +38,7 @@ class Indexer:
                     hash TEXT,
                     first_seen REAL,
                     last_seen REAL,
+                    last_scan REAL,
                     deleted INTEGER DEFAULT 0,
                     UNIQUE(root_path, rel_path)
                 )
@@ -77,7 +85,6 @@ class Indexer:
                     stat = os.stat(full_path)
                     size = stat.st_size
                     mtime = stat.st_mtime
-                    # Для больших файлов можно пропустить хэш, но мы вычисляем всегда
                     file_hash = self._compute_hash(full_path)
                     file_list.append((root_path, rel_path, size, mtime, file_hash))
                 except (OSError, PermissionError) as e:
@@ -90,39 +97,58 @@ class Indexer:
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
 
-            # Помечаем все существующие записи для этого root_path как удалённые (временно)
-            # Мы их обновим позже
+            # Помечаем все существующие записи для этого root_path как удалённые
             cursor.execute(
                 "UPDATE files SET deleted = 1 WHERE root_path = ?",
                 (root_path,)
             )
 
             for root, rel, size, mtime, file_hash in file_list:
+                # Проверяем, есть ли уже такой файл в БД
                 cursor.execute(
-                    """
-                    INSERT INTO files (root_path, rel_path, size, mtime, hash, first_seen, last_seen, deleted)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, 0)
-                    ON CONFLICT(root_path, rel_path) DO UPDATE SET
-                        size = excluded.size,
-                        mtime = excluded.mtime,
-                        hash = excluded.hash,
-                        last_seen = excluded.last_seen,
-                        deleted = 0
-                    """,
-                    (root, rel, size, mtime, file_hash, now, now)
+                    "SELECT id, size, mtime, hash, first_seen FROM files WHERE root_path = ? AND rel_path = ?",
+                    (root, rel)
                 )
-                # Проверяем, была ли запись новой или обновлённой
-                if cursor.rowcount == 1:  # вставка новой
-                    stats["new"] += 1
+                existing = cursor.fetchone()
+                
+                if existing:
+                    old_id, old_size, old_mtime, old_hash, first_seen = existing
+                    # Сравниваем размер, время модификации и хэш
+                    if old_size != size or old_mtime != mtime or old_hash != file_hash:
+                        # Файл ИЗМЕНИЛСЯ
+                        cursor.execute(
+                            """
+                            UPDATE files 
+                            SET size = ?, mtime = ?, hash = ?, last_seen = ?, last_scan = ?, deleted = 0
+                            WHERE id = ?
+                            """,
+                            (size, mtime, file_hash, now, now, old_id)
+                        )
+                        stats["updated"] += 1
+                    else:
+                        # Файл НЕ ИЗМЕНИЛСЯ - обновляем только время сканирования
+                        cursor.execute(
+                            """
+                            UPDATE files 
+                            SET last_scan = ?, deleted = 0
+                            WHERE id = ?
+                            """,
+                            (now, old_id)
+                        )
                 else:
-                    stats["updated"] += 1
+                    # Новый файл
+                    cursor.execute(
+                        """
+                        INSERT INTO files (root_path, rel_path, size, mtime, hash, first_seen, last_seen, last_scan, deleted)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
+                        """,
+                        (root, rel, size, mtime, file_hash, now, now, now)
+                    )
+                    stats["new"] += 1
 
-            # Оставляем записи, которые остались deleted=1 (они реально удалены)
-            # Но не удаляем их, чтобы сохранить историю
             conn.commit()
 
-        # Убираем из статистики дублирование (rowcount не совсем точен для обновлений, но приблизительно)
-        # Лучше пересчитать
+        # Получаем количество активных файлов
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
             cursor.execute(
@@ -130,11 +156,10 @@ class Indexer:
                 (root_path,)
             )
             active = cursor.fetchone()[0]
-            # Статистика: новые - это те, у которых first_seen == last_seen и не deleted? 
-            # Мы просто выведем общее количество активных
             stats["active"] = active
 
         print(f"Сканирование завершено. Всего файлов: {stats['total']}, "
+              f"новых: {stats['new']}, изменённых: {stats['updated']}, "
               f"активных в индексе: {stats['active']}, ошибок: {stats['errors']}")
         return stats
 
@@ -251,64 +276,132 @@ class Indexer:
     def show_changes(self, root_path=None):
         """
         Показывает файлы, добавленные, изменённые или удалённые
-        с момента последнего сканирования (для указанной папки или всех).
+        с момента последнего сканирования.
         """
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
-            # Для каждого root_path определяем последнее сканирование (max last_seen)
-            # Но проще показать все файлы, у которых first_seen == last_seen (новые)
-            # и файлы, у которых deleted = 1 (удалены)
-            query = """
-                SELECT root_path, rel_path, size, first_seen, last_seen, deleted
-                FROM files
-                WHERE 1=1
-            """
-            params = []
+            
+            # Для каждой папки получаем время последнего сканирования
             if root_path:
-                query += " AND root_path = ?"
-                params.append(root_path)
-            cursor.execute(query, params)
-            rows = cursor.fetchall()
-
-        new_files = []
-        changed_files = []
-        deleted_files = []
-
-        for root, rel, size, first, last, deleted in rows:
-            if deleted:
-                deleted_files.append((root, rel))
-            elif first == last:
-                new_files.append((root, rel, size))
+                cursor.execute(
+                    "SELECT MAX(last_scan) FROM files WHERE root_path = ?",
+                    (root_path,)
+                )
+                last_scan_time = cursor.fetchone()[0]
+                if last_scan_time is None:
+                    print("Индекс пуст. Выполните сканирование.")
+                    return
+                
+                # Новые файлы
+                cursor.execute(
+                    """
+                    SELECT root_path, rel_path, size
+                    FROM files
+                    WHERE root_path = ? AND first_seen >= ? AND deleted = 0
+                    """,
+                    (root_path, last_scan_time)
+                )
+                all_new = cursor.fetchall()
+                
+                # Изменённые файлы
+                cursor.execute(
+                    """
+                    SELECT root_path, rel_path, size
+                    FROM files
+                    WHERE root_path = ? AND last_seen >= ? AND deleted = 0 AND first_seen < ?
+                    """,
+                    (root_path, last_scan_time, last_scan_time)
+                )
+                all_changed = cursor.fetchall()
+                
+                # Удалённые файлы
+                cursor.execute(
+                    """
+                    SELECT root_path, rel_path
+                    FROM files
+                    WHERE root_path = ? AND deleted = 1
+                    """,
+                    (root_path,)
+                )
+                all_deleted = cursor.fetchall()
+                
             else:
-                # Изменённые: проверим, не изменился ли размер или mtime? 
-                # Но мы не храним историю старых значений, поэтому считаем изменёнными,
-                # если first_seen != last_seen, но не новые
-                changed_files.append((root, rel, size))
+                # Для всех папок
+                cursor.execute(
+                    "SELECT DISTINCT root_path FROM files"
+                )
+                roots = cursor.fetchall()
+                
+                all_new = []
+                all_changed = []
+                all_deleted = []
+                
+                for (root,) in roots:
+                    cursor.execute(
+                        "SELECT MAX(last_scan) FROM files WHERE root_path = ?",
+                        (root,)
+                    )
+                    last_scan_time = cursor.fetchone()[0]
+                    if last_scan_time is None:
+                        continue
+                    
+                    # Новые файлы
+                    cursor.execute(
+                        """
+                        SELECT root_path, rel_path, size
+                        FROM files
+                        WHERE root_path = ? AND first_seen >= ? AND deleted = 0
+                        """,
+                        (root, last_scan_time)
+                    )
+                    all_new.extend(cursor.fetchall())
+                    
+                    # Изменённые файлы
+                    cursor.execute(
+                        """
+                        SELECT root_path, rel_path, size
+                        FROM files
+                        WHERE root_path = ? AND last_seen >= ? AND deleted = 0 AND first_seen < ?
+                        """,
+                        (root, last_scan_time, last_scan_time)
+                    )
+                    all_changed.extend(cursor.fetchall())
+                    
+                    # Удалённые файлы
+                    cursor.execute(
+                        """
+                        SELECT root_path, rel_path
+                        FROM files
+                        WHERE root_path = ? AND deleted = 1
+                        """,
+                        (root,)
+                    )
+                    all_deleted.extend(cursor.fetchall())
 
-        if not any([new_files, changed_files, deleted_files]):
+        if not any([all_new, all_changed, all_deleted]):
             print("Изменений не обнаружено (или индекс пуст).")
             return
 
-        if new_files:
-            print(f"\nНовые файлы ({len(new_files)}):")
-            for root, rel, size in new_files[:20]:  # ограничим вывод
+        if all_new:
+            print(f"\nНовые файлы ({len(all_new)}):")
+            for root, rel, size in all_new[:20]:
                 print(f"  - {os.path.join(root, rel)} ({size} байт)")
-            if len(new_files) > 20:
-                print(f"  ... и ещё {len(new_files)-20}")
+            if len(all_new) > 20:
+                print(f"  ... и ещё {len(all_new)-20}")
 
-        if changed_files:
-            print(f"\nИзменённые файлы ({len(changed_files)}):")
-            for root, rel, size in changed_files[:20]:
+        if all_changed:
+            print(f"\nИзменённые файлы ({len(all_changed)}):")
+            for root, rel, size in all_changed[:20]:
                 print(f"  - {os.path.join(root, rel)} ({size} байт)")
-            if len(changed_files) > 20:
-                print(f"  ... и ещё {len(changed_files)-20}")
+            if len(all_changed) > 20:
+                print(f"  ... и ещё {len(all_changed)-20}")
 
-        if deleted_files:
-            print(f"\nУдалённые файлы ({len(deleted_files)}):")
-            for root, rel in deleted_files[:20]:
+        if all_deleted:
+            print(f"\nУдалённые файлы ({len(all_deleted)}):")
+            for root, rel in all_deleted[:20]:
                 print(f"  - {os.path.join(root, rel)}")
-            if len(deleted_files) > 20:
-                print(f"  ... и ещё {len(deleted_files)-20}")
+            if len(all_deleted) > 20:
+                print(f"  ... и ещё {len(all_deleted)-20}")
 
     def status(self, root_path=None):
         """Показывает общую статистику по индексу."""
@@ -351,30 +444,66 @@ class Indexer:
 
 
 def main():
+    # Создаём парсер с красивым форматированием
     parser = argparse.ArgumentParser(
-        description="Консольный индексатор папок с поиском дубликатов и сравнением резервных копий."
+        description="Консольный индексатор папок с поиском дубликатов и сравнением резервных копий.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Примеры использования:
+  python indexer.py scan D:\\Documents                - Просканировать папку
+  python indexer.py duplicates                       - Найти дубликаты
+  python indexer.py compare D:\\Original E:\\Backup   - Сравнить папки
+  python indexer.py changes                          - Показать изменения
+  python indexer.py status                           - Показать статистику
+        """
     )
+    
     subparsers = parser.add_subparsers(dest="command", required=True, help="Доступные команды")
 
     # scan
-    scan_parser = subparsers.add_parser("scan", help="Просканировать папку и обновить индекс")
+    scan_parser = subparsers.add_parser(
+        "scan", 
+        help="Просканировать папку и обновить индекс",
+        description="Сканирует указанную папку, сохраняет метаданные файлов в базу данных",
+        epilog="Пример: python indexer.py scan D:\\Documents"
+    )
     scan_parser.add_argument("path", help="Путь к папке для сканирования")
 
     # duplicates
-    dup_parser = subparsers.add_parser("duplicates", help="Найти дубликаты файлов")
+    dup_parser = subparsers.add_parser(
+        "duplicates",
+        help="Найти дубликаты файлов",
+        description="Находит дублирующиеся файлы на основе SHA-256 хэшей",
+        epilog="Пример: python indexer.py duplicates --path D:\\Documents"
+    )
     dup_parser.add_argument("--path", help="Ограничить поиск указанной папкой", default=None)
 
     # compare
-    comp_parser = subparsers.add_parser("compare", help="Сравнить две папки (источник и резерв)")
+    comp_parser = subparsers.add_parser(
+        "compare",
+        help="Сравнить две папки (источник и резерв)",
+        description="Сравнивает исходную папку и резервную копию, выявляет различия",
+        epilog="Пример: python indexer.py compare D:\\Original E:\\Backup"
+    )
     comp_parser.add_argument("source", help="Путь к исходной папке")
     comp_parser.add_argument("backup", help="Путь к папке резервной копии")
 
     # changes
-    changes_parser = subparsers.add_parser("changes", help="Показать изменения с последнего сканирования")
+    changes_parser = subparsers.add_parser(
+        "changes",
+        help="Показать изменения с последнего сканирования",
+        description="Отображает новые, изменённые и удалённые файлы",
+        epilog="Пример: python indexer.py changes --path D:\\Documents"
+    )
     changes_parser.add_argument("--path", help="Ограничить указанной папкой", default=None)
 
     # status
-    status_parser = subparsers.add_parser("status", help="Показать статистику индекса")
+    status_parser = subparsers.add_parser(
+        "status",
+        help="Показать статистику индекса",
+        description="Выводит общую статистику по индексированным файлам",
+        epilog="Пример: python indexer.py status --path D:\\Documents"
+    )
     status_parser.add_argument("--path", help="Статистика для конкретной папки", default=None)
 
     args = parser.parse_args()
